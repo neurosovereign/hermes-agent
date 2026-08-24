@@ -2405,13 +2405,12 @@ class MatrixAdapter(BasePlatformAdapter):
                     "Matrix: initial key share failed (%s)",
                     type(exc).__name__,
                 )
-            if (
-                self._e2ee_recipient_enforcement_active
-                and not await self._reconcile_encrypted_rooms()
-            ):
-                logger.error("Matrix: refusing readiness after encrypted-room reconciliation failure")
-                await self._disconnect_impl()
-                return False
+            if self._e2ee_recipient_enforcement_active:
+                # Per-room reconcile failures are logged inside
+                # _reconcile_encrypted_rooms(); the send path fails closed
+                # per room via _ensure_encrypted_room_ready(). One unready
+                # room must not take every Matrix room offline.
+                await self._reconcile_encrypted_rooms()
 
         # Start the sync loop.
         self._sync_task = asyncio.create_task(self._sync_loop())
@@ -2626,10 +2625,11 @@ class MatrixAdapter(BasePlatformAdapter):
             raise RuntimeError("Matrix E2EE device refresh is unavailable")
 
         now = time.monotonic()
+        last = self._device_refresh_ts.get(room_id)
         if (
             self._device_refresh_interval > 0
-            and now - self._device_refresh_ts.get(room_id, 0.0)
-            < self._device_refresh_interval
+            and last is not None
+            and now - last < self._device_refresh_interval
         ):
             return
 
@@ -2656,10 +2656,6 @@ class MatrixAdapter(BasePlatformAdapter):
                 for user_id, devices in fresh_by_user.items()
             }
             for user_id, devices in fresh_by_user.items():
-                if not devices:
-                    self._device_refresh_ts.pop(room_id, None)
-                    self._e2ee_room_targets.pop(room_id, None)
-                    raise RuntimeError(f"Matrix device refresh returned no devices for {user_id}")
                 for device_id, device_keys in devices.items():
                     keys = getattr(device_keys, "keys", {}) or {}
                     if not keys.get(f"curve25519:{device_id}") or not keys.get(
@@ -2700,10 +2696,6 @@ class MatrixAdapter(BasePlatformAdapter):
                     )
         for user_id in users:
             fetched_devices = (fetched or {}).get(user_id)
-            if not fetched_devices:
-                self._device_refresh_ts.pop(room_id, None)
-                self._e2ee_room_targets.pop(room_id, None)
-                raise RuntimeError(f"Matrix device refresh returned no devices for {user_id}")
             if any(
                 not getattr(device, "identity_key", "")
                 for device in fetched_devices.values()
@@ -2859,9 +2851,14 @@ class MatrixAdapter(BasePlatformAdapter):
                 set(targets),
             )
 
-    async def _reconcile_encrypted_rooms(self) -> bool:
-        """Re-share active Megolm sessions after initial sync/reconnect."""
-        success = True
+    async def _reconcile_encrypted_rooms(self) -> None:
+        """Re-share active Megolm sessions after initial sync/reconnect.
+
+        Reconciliation is best-effort per room: a room whose key refresh
+        fails stays fail-closed for sends (``_ensure_encrypted_room_ready``
+        re-raises on the send path) but must not take healthy rooms or the
+        whole transport offline.
+        """
         async with self._e2ee_share_lock:
             self._device_refresh_ts.clear()
             self._e2ee_room_targets.clear()
@@ -2872,13 +2869,11 @@ class MatrixAdapter(BasePlatformAdapter):
                     timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
                 )
             except Exception as exc:
-                success = False
                 logger.error(
                     "Matrix: encrypted-room key reconciliation failed for %s (%s)",
                     room_id,
                     type(exc).__name__,
                 )
-        return success
 
     def _capture_lifecycle_token(self) -> tuple[int, bool]:
         return (

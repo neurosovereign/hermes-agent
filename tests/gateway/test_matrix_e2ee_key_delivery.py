@@ -199,6 +199,25 @@ async def test_zero_refresh_interval_still_refreshes_every_readiness_check():
 
 
 @pytest.mark.asyncio
+async def test_first_refresh_runs_both_key_layers_when_monotonic_below_interval(
+    monkeypatch,
+):
+    adapter, _session, _store, crypto = make_adapter()
+    # Pin monotonic uptime below the 300s refresh interval so the old
+    # `now - 0.0 < interval` sentinel would have throttled the first
+    # readiness check on a first-seen room.
+    monkeypatch.setattr(
+        "plugins.platforms.matrix.adapter.time.monotonic",
+        lambda: 30.0,
+    )
+
+    await adapter._ensure_encrypted_room_ready(ROOM)
+
+    adapter._client.query_keys.assert_awaited_once()
+    crypto._fetch_keys.assert_awaited_once_with([PEER], include_untracked=True)
+
+
+@pytest.mark.asyncio
 async def test_encrypted_room_without_joined_peers_fails_closed():
     adapter, _session, _store, _crypto = make_adapter()
     adapter._client.get_joined_members = AsyncMock(return_value={})
@@ -214,6 +233,70 @@ async def test_deleted_peer_device_is_not_an_e2ee_target():
 
     with pytest.raises(RuntimeError, match="no eligible peer devices"):
         await adapter._ensure_encrypted_room_ready(ROOM)
+
+
+@pytest.mark.asyncio
+async def test_present_empty_peer_device_map_does_not_fail_room():
+    adapter, _session, store, crypto = make_adapter()
+    bob = UserID("@bob:example.org")
+    adapter._client.get_joined_members = AsyncMock(
+        return_value={PEER: object(), bob: object()}
+    )
+    adapter._client.query_keys = AsyncMock(
+        return_value=SimpleNamespace(
+            failures={},
+            device_keys={
+                PEER: {
+                    DEVICE: SimpleNamespace(
+                        keys={
+                            f"curve25519:{DEVICE}": IDENTITY_KEY,
+                            f"ed25519:{DEVICE}": "ed25519:alice",
+                        }
+                    )
+                },
+                bob: {},
+            },
+        )
+    )
+    crypto._fetch_keys = AsyncMock(
+        return_value={
+            PEER: {DEVICE: SimpleNamespace(identity_key=IDENTITY_KEY)},
+            bob: {},
+        }
+    )
+    store.devices[bob] = {}
+
+    await adapter._ensure_encrypted_room_ready(ROOM)
+
+    crypto.share_group_session.assert_awaited_once_with(ROOM, [PEER, bob])
+    assert adapter._e2ee_room_targets[ROOM] == ("session-1", {TARGET})
+
+
+@pytest.mark.asyncio
+async def test_all_peers_with_zero_devices_fails_closed_without_send():
+    adapter, _session, store, crypto = make_adapter()
+    bob = UserID("@bob:example.org")
+    adapter._client.get_joined_members = AsyncMock(
+        return_value={PEER: object(), bob: object()}
+    )
+    adapter._client.query_keys = AsyncMock(
+        return_value=SimpleNamespace(
+            failures={},
+            device_keys={PEER: {}, bob: {}},
+        )
+    )
+    crypto._fetch_keys = AsyncMock(return_value={PEER: {}, bob: {}})
+    store.devices = {PEER: {}, bob: {}}
+
+    with pytest.raises(RuntimeError, match="no eligible peer devices"):
+        await adapter._send_room_event(
+            ROOM,
+            "m.room.message",
+            {"msgtype": "m.text", "body": "must not send"},
+        )
+
+    adapter._client.send_message_event.assert_not_awaited()
+    crypto.share_group_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -410,6 +493,58 @@ async def test_room_event_is_not_sent_before_key_delivery_is_verified():
 
     assert event_id == "$event:example.org"
     crypto.share_group_session.assert_awaited_once()
+    adapter._client.send_message_event.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_failure_in_one_room_keeps_healthy_room_usable():
+    adapter, _session, _store, crypto = make_adapter()
+    healthy_room = "!healthy:example.org"
+    bad_room = "!bad:example.org"
+    bad_user = UserID("@mallory:example.org")
+    adapter._joined_rooms = {healthy_room, bad_room}
+
+    async def query_keys_side_effect(users):
+        if bad_user in users:
+            return SimpleNamespace(
+                failures={bad_user: {"error": "key query failed"}},
+                device_keys={},
+            )
+        return SimpleNamespace(
+            failures={},
+            device_keys={
+                PEER: {
+                    DEVICE: SimpleNamespace(
+                        keys={
+                            f"curve25519:{DEVICE}": IDENTITY_KEY,
+                            f"ed25519:{DEVICE}": "ed25519:alice",
+                        }
+                    )
+                }
+            },
+        )
+
+    adapter._client.query_keys = AsyncMock(side_effect=query_keys_side_effect)
+    adapter._client.get_joined_members = AsyncMock(
+        side_effect=lambda room_id: (
+            {PEER: object()}
+            if str(room_id) == healthy_room
+            else {bad_user: object()}
+        )
+    )
+
+    result = await adapter._reconcile_encrypted_rooms()
+
+    # One room's key-query failure is logged, not aggregated into a
+    # transport-level failure.
+    assert result is None
+    # The healthy room remains usable: a send to it succeeds.
+    event_id = await adapter._send_room_event(
+        healthy_room,
+        "m.room.message",
+        {"msgtype": "m.text", "body": "hello"},
+    )
+    assert event_id == "$event:example.org"
     adapter._client.send_message_event.assert_awaited_once()
 
 

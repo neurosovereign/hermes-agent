@@ -2842,6 +2842,68 @@ class TestMatrixReconnectDisconnect:
         adapter._disconnect_impl.assert_awaited_once()
 
 
+class TestMatrixReconcileFailureIsolation:
+    """A per-room reconcile failure must not take the whole adapter offline."""
+
+    @pytest.mark.asyncio
+    async def test_connect_does_not_disconnect_when_reconcile_reports_failure(self):
+        """connect() must not disconnect the adapter because one room's
+        encrypted-room reconciliation failed; the send path fails closed per
+        room instead."""
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test_access_token",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "encryption": True,
+            },
+        )
+        adapter = MatrixAdapter(config)
+        adapter._disconnect_impl = AsyncMock()
+
+        fake_mautrix_mods = _make_fake_mautrix()
+
+        mock_client = MagicMock()
+        mock_client.mxid = "@bot:example.org"
+        mock_client.device_id = None
+        mock_client.state_store = MagicMock()
+        mock_client.sync_store = MagicMock()
+        mock_client.crypto = None
+        mock_client.whoami = AsyncMock(return_value=MagicMock(
+            user_id="@bot:example.org", device_id=None,
+        ))
+        mock_client.query_keys = AsyncMock(return_value=MagicMock(device_keys={}))
+        mock_client.sync = AsyncMock(return_value={"rooms": {"join": {}}})
+        mock_client.add_event_handler = MagicMock()
+        mock_client.handle_sync = MagicMock(return_value=[])
+        mock_client.api = MagicMock()
+        mock_client.api.token = "syt_test_access_token"
+        mock_client.api.session = MagicMock()
+        mock_client.api.session.close = AsyncMock()
+
+        fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=mock_client)
+
+        import plugins.platforms.matrix.adapter as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
+            with patch.dict("sys.modules", fake_mautrix_mods):
+                with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                        with patch.object(
+                            adapter,
+                            "_reconcile_encrypted_rooms",
+                            AsyncMock(return_value=False),
+                        ):
+                            result = await adapter.connect()
+
+        assert result is True
+        adapter._disconnect_impl.assert_not_awaited()
+        if adapter._sync_task is not None:
+            await adapter._sync_task
+
+
 class TestDeviceIdRecoveryOnReconnect:
     """_device_id_unverified must reset on every connect() call so a
     recovery after a failed resolution clears the stuck-true flag."""
