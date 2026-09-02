@@ -273,3 +273,82 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
 
+
+
+class TestSetSessionEnvProfileCwd:
+    """Multiplex gateways: _set_session_env pins the session cwd from the
+    SESSION profile's own terminal.cwd (not the launch profile's process-global
+    TERMINAL_CWD). When nothing is configured, _SESSION_CWD must resolve via
+    the legacy fallback (TERMINAL_CWD env) unchanged."""
+
+    @pytest.fixture()
+    def profile_tree(self, tmp_path, monkeypatch):
+        import hermes_cli.profiles as profiles_mod
+
+        home = tmp_path / "hermes"
+        profiles_root = home / "profiles"
+        monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: profiles_root)
+        monkeypatch.setattr(profiles_mod, "_get_default_hermes_home", lambda: home)
+        return {"home": home, "profiles_root": profiles_root}
+
+    def _context(self, profile):
+        source = SessionSource(
+            platform=Platform.MATRIX,
+            chat_id="!room:example",
+            chat_type="dm",
+            user_id="@u:example",
+            profile=profile,
+        )
+        return SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    def test_profile_cwd_pinned(self, profile_tree, tmp_path):
+        import agent.runtime_cwd as rt
+
+        ws = tmp_path / "alpha-ws"
+        ws.mkdir()
+        phome = profile_tree["profiles_root"] / "alpha"
+        phome.mkdir(parents=True)
+        (phome / "config.yaml").write_text(
+            "terminal:\n  cwd: %s\n" % ws, encoding="utf-8"
+        )
+
+        runner = object.__new__(GatewayRunner)
+        tokens = runner._set_session_env(self._context("alpha"))
+        try:
+            assert rt.resolve_agent_cwd() == ws
+            assert rt.resolve_context_cwd() == ws
+        finally:
+            runner._clear_session_env(tokens)
+            rt._SESSION_CWD.set(_UNSET)
+
+    def _assert_legacy_fallback(self, monkeypatch, tmp_path, context):
+        """With no per-profile cwd pinned, resolution must fall back to the
+        process-global TERMINAL_CWD exactly as before the fix."""
+        import agent.runtime_cwd as rt
+
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        runner = object.__new__(GatewayRunner)
+        tokens = runner._set_session_env(context)
+        try:
+            assert rt.resolve_context_cwd() == tmp_path
+        finally:
+            runner._clear_session_env(tokens)
+
+    def test_profile_without_cwd_keeps_legacy_fallback(self, profile_tree, monkeypatch, tmp_path):
+        phome = profile_tree["profiles_root"] / "beta"
+        phome.mkdir(parents=True)
+        (phome / "config.yaml").write_text("terminal:\n  backend: local\n", encoding="utf-8")
+        self._assert_legacy_fallback(monkeypatch, tmp_path, self._context("beta"))
+
+    def test_no_profile_keeps_legacy_fallback(self, profile_tree, monkeypatch, tmp_path):
+        self._assert_legacy_fallback(monkeypatch, tmp_path, self._context(None))
+
+    def test_resolver_error_fails_open(self, profile_tree, monkeypatch, tmp_path):
+        import agent.runtime_cwd as rt
+
+        monkeypatch.setattr(
+            rt,
+            "resolve_profile_terminal_cwd",
+            lambda name: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        self._assert_legacy_fallback(monkeypatch, tmp_path, self._context("alpha"))

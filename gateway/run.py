@@ -27187,6 +27187,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        # Multiplex gateways serve every profile from one process, so the
+        # process-global TERMINAL_CWD belongs to the launch profile. Pin the
+        # session cwd from the SESSION profile's own terminal.cwd instead
+        # (same bug class as #40334 in the TUI gateway). When the profile has
+        # no configured cwd, ``cwd`` stays "" so _SESSION_CWD resolves via
+        # the legacy fallback unchanged.
+        _session_cwd = ""
+        _profile_name = getattr(context.source, "profile", "") or ""
+        if _profile_name:
+            try:
+                from agent.runtime_cwd import resolve_profile_terminal_cwd
+
+                _session_cwd = resolve_profile_terminal_cwd(_profile_name) or ""
+            except Exception:
+                logger.debug(
+                    "profile cwd resolution failed for %r", _profile_name,
+                    exc_info=True,
+                )
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -27202,6 +27220,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=_session_cwd,
             async_delivery=_async_delivery,
             cron_session="",
         )
